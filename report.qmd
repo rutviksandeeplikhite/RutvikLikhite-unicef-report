@@ -1,7 +1,7 @@
 ---
 title: "The Silent Epidemic: HIV Among the World's Children"
 subtitle: "A UNICEF Data Report | BAA1030"
-author: "Rutvik Hudl"
+author: "Rutvik Likhite (A00056095)"
 date: today
 format:
   html:
