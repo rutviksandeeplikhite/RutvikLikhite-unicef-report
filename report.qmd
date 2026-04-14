@@ -1,0 +1,428 @@
+---
+title: "The Silent Epidemic: HIV Among the World's Children"
+subtitle: "A UNICEF Data Report | BAA1030"
+author: "Rutvik Hudl"
+date: today
+format:
+  html:
+    embed-resources: true
+    code-fold: true
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    toc-title: "📋 Table of Contents"
+    smooth-scroll: true
+    highlight-style: github
+    number-sections: true
+    fig-align: center
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+## Introduction
+
+Every year, hundreds of thousands of children are born into a world where **HIV still poses a devastating threat**. Despite decades of global health efforts, the epidemic continues to disproportionately affect the world's most vulnerable populations — particularly in *Sub-Saharan Africa*.
+
+In **2024 alone**, South Africa recorded an estimated **39,000 new HIV infections**, making it the hardest-hit country in this dataset. Mozambique followed with **17,000**, and India with **15,000** — together these three countries account for a staggering share of global new infections.
+
+This report uses **UNICEF data** to explore the global landscape of new HIV infections, examining:
+
+- Which countries carry the **heaviest burden** of new infections
+- How **national wealth** relates to HIV outcomes
+- Whether **progress is being made** over time
+- The relationship between **child underweight rates** and HIV burden
+
+> *"AIDS is no longer just a disease, it is a human rights issue."* — Nelson Mandela
+
+---
+
+## Data & Methodology
+
+The analysis draws on three UNICEF datasets:
+
+- **unicef_indicator_1.csv** — Estimated number of new HIV infections by country (2010–2024), broken down by sex
+- **unicef_indicator_2.csv** — Child underweight rates (Weight-for-age below -2 SD) by country and year
+- **unicef_metadata.csv** — Country-level metadata including GDP per capita, life expectancy, and population
+
+All monetary values are expressed in **constant 2015 USD**. Values reported as ranges (e.g., `<100`) have been converted to their numeric midpoint for analysis.
+
+```{python}
+#| label: setup
+#| code-summary: "📦 Load libraries and data"
+
+# ── Core libraries ────────────────────────────────────────────────
+import pandas as pd
+import numpy as np
+import ssl
+import os
+import urllib.request
+import geopandas as gpd
+
+from plotnine import (
+    ggplot, aes,
+    geom_map, geom_col, geom_point, geom_line, geom_smooth,
+    scale_fill_gradient, scale_color_gradient, scale_color_manual,
+    scale_x_log10, scale_y_log10, scale_y_continuous,
+    coord_flip,
+    theme_minimal, theme_void,
+    theme, element_text, element_blank,
+    labs,
+)
+import warnings
+warnings.filterwarnings("ignore")
+
+# ── Load the three CSV files ──────────────────────────────────────
+# pd.read_csv reads a CSV file into a DataFrame (like a spreadsheet in Python)
+ind1 = pd.read_csv("unicef_indicator_1.csv")   # HIV infections
+ind2 = pd.read_csv("unicef_indicator_2.csv")   # Child underweight
+meta = pd.read_csv("unicef_metadata.csv")      # Country metadata
+
+# ── Clean function for values like <100, >500 ─────────────────────
+# UNICEF reports some values as "<100" meaning "less than 100"
+# We convert these to a number (half of the threshold) so we can plot them
+def clean_obs(val):
+    val = str(val).replace(",", "").strip()
+    if val.startswith("<"):
+        try: return float(val[1:]) / 2      # <100 becomes 50
+        except: return np.nan
+    elif val.startswith(">"):
+        try: return float(val[1:])           # >500 becomes 500
+        except: return np.nan
+    else:
+        try: return float(val)
+        except: return np.nan
+
+# Apply the cleaning function to both indicator files
+ind1["obs_value"] = ind1["obs_value"].apply(clean_obs)
+ind2["obs_value"] = ind2["obs_value"].apply(clean_obs)
+
+# ── Standardise column names to lowercase with underscores ────────
+# This makes it easier to type column names in code
+ind1.columns = ind1.columns.str.strip().str.lower().str.replace(" ", "_").str.replace(",","").str.replace("(","").str.replace(")","").str.replace("%","pct")
+ind2.columns = ind2.columns.str.strip().str.lower().str.replace(" ", "_").str.replace(",","").str.replace("(","").str.replace(")","").str.replace("%","pct")
+meta.columns = meta.columns.str.strip().str.lower().str.replace(" ", "_").str.replace(",","").str.replace("(","").str.replace(")","").str.replace("%","pct")
+
+# ── Print a summary to confirm everything loaded correctly ────────
+print(f"✅ Indicator 1 (HIV):        {ind1.shape[0]:,} rows, {ind1.shape[1]} columns")
+print(f"✅ Indicator 2 (Underweight):{ind2.shape[0]:,} rows, {ind2.shape[1]} columns")
+print(f"✅ Metadata:                 {meta.shape[0]:,} rows, {meta.shape[1]} columns")
+print(f"\nSex categories in Indicator 1: {ind1['sex'].unique().tolist()}")
+print(f"Year range: {ind1['time_period'].min()} – {ind1['time_period'].max()}")
+```
+
+```{python}
+#| label: data-prep
+#| code-summary: "🔧 Prepare analysis datasets"
+
+# ── Get the most recent HIV value per country (Total sex only) ────
+# We filter for "Total" so we don't double-count Male + Female
+# Then we sort by year descending and take the first (= most recent) row per country
+ind1_total = ind1[ind1["sex"] == "Total"].copy()
+
+ind1_latest = (
+    ind1_total
+    .dropna(subset=["obs_value"])           # remove rows with no value
+    .sort_values("time_period", ascending=False)   # newest year first
+    .groupby("country", as_index=False)     # group by country
+    .first()                                # keep only the most recent row
+)
+
+# ── Get most recent metadata per country ─────────────────────────
+# Find the exact GDP column name (it has special characters)
+gdp_col  = next(c for c in meta.columns if "gdp_per_capita" in c)
+life_col = next(c for c in meta.columns if "life_expectancy" in c)
+
+meta_latest = (
+    meta.dropna(subset=[gdp_col])
+    .sort_values("year", ascending=False)
+    .groupby("country", as_index=False)
+    .first()
+)
+
+print(f"Countries in HIV dataset:       {len(ind1_latest)}")
+print(f"Top 5 by new infections (2024):")
+print(ind1_latest.nlargest(5, "obs_value")[["country", "obs_value", "time_period"]].to_string(index=False))
+```
+
+---
+
+## 🗺️ Global Overview — World Map {#sec-map}
+
+The map below reveals a stark **geographic concentration** of new HIV infections. Sub-Saharan Africa — particularly eastern and southern regions — bears a disproportionate share of the global burden, while high-income nations in Europe and North America show dramatically lower rates.
+
+```{python}
+#| label: fig-map
+#| fig-cap: "Estimated new HIV infections per country, most recent year available. Grey = no data."
+#| fig-width: 12
+#| fig-height: 6
+#| code-summary: "🗺️ World Map Chart"
+
+# ── Download world shapefile (bypasses macOS SSL issue) ───────────
+# A shapefile contains the geographic boundaries of every country
+# We download it from GitHub and save it locally so we only need internet once
+GEOJSON = "countries.geojson"
+URL = "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_110m_admin_0_countries.geojson"
+
+if not os.path.exists(GEOJSON):
+    # This bypasses the SSL certificate issue on older macOS versions
+    ssl._create_default_https_context = ssl._create_unverified_context
+    urllib.request.urlretrieve(URL, GEOJSON)
+    print("Downloaded shapefile ✅")
+
+# Load the shapefile into a GeoDataFrame (like a DataFrame but with geometry)
+world_gdf = gpd.read_file(GEOJSON)
+# Rename columns to match what we need
+world_gdf = world_gdf.rename(columns={"ADMIN": "name", "ADM0_A3": "iso_a3"})
+
+# ── Fix country name mismatches between UNICEF and shapefile ──────
+# UNICEF uses different names than the shapefile for some countries
+name_fixes = {
+    "Tanzania, United Republic of": "Tanzania",
+    "Democratic Republic of the Congo": "Dem. Rep. Congo",
+    "Central African Republic": "Central African Rep.",
+    "South Sudan": "S. Sudan",
+    "Eswatini": "eSwatini",
+    "Côte d'Ivoire": "Ivory Coast",
+    "Congo": "Congo",
+    "Lao People's Democratic Republic": "Laos",
+    "Viet Nam": "Vietnam",
+    "Bolivia (Plurinational State of)": "Bolivia",
+    "Venezuela (Bolivarian Republic of)": "Venezuela",
+}
+ind1_latest["map_country"] = ind1_latest["country"].replace(name_fixes)
+
+# ── Merge: attach HIV data onto the world map ─────────────────────
+# Left join keeps ALL countries in the map — unmatched ones show grey
+world_merged = world_gdf.merge(
+    ind1_latest[["map_country", "obs_value"]],
+    left_on="name",
+    right_on="map_country",
+    how="left"
+)
+
+# ── Plot ──────────────────────────────────────────────────────────
+(
+    ggplot(world_merged)
+    + geom_map(aes(fill="obs_value"), color="white", size=0.15)
+    + scale_fill_gradient(
+        low="#ffe0b2", high="#b71c1c",
+        na_value="#e0e0e0",
+        name="New HIV\nInfections",
+        trans="log10",   # log scale because values range from <50 to 39,000
+    )
+    + theme_void()
+    + theme(
+        legend_position="bottom",
+        plot_title=element_text(size=13, weight="bold"),
+        plot_subtitle=element_text(size=10, color="#555555"),
+        figure_size=(12, 6),
+    )
+    + labs(
+        title="Where Are Children Most at Risk? — New HIV Infections by Country",
+        subtitle="Colour scale is logarithmic — darker red = more infections | Grey = no data",
+        caption="Source: UNICEF Indicator Data",
+    )
+)
+```
+
+The map makes the geographic inequality unmistakable. **Southern and Eastern Africa** dominate in deep red, while most of Europe, North America, and East Asia remain pale — reflecting not just disease burden but also vast differences in healthcare access, prevention infrastructure, and socioeconomic conditions.
+
+---
+
+## 📊 The Hardest Hit Countries — Bar Chart {#sec-bar}
+
+Looking at individual countries, the concentration of the epidemic becomes even clearer. The 15 countries below collectively account for the vast majority of all new HIV infections recorded in UNICEF data.
+
+```{python}
+#| label: fig-bar
+#| fig-cap: "Top 15 countries by estimated new HIV infections (most recent year available)."
+#| fig-width: 9
+#| fig-height: 6
+#| code-summary: "📊 Bar Chart"
+
+# ── Get top 15 countries ──────────────────────────────────────────
+# nlargest(15, "obs_value") picks the 15 rows with the highest obs_value
+# sort_values ascending=True so the longest bar appears at the top after coord_flip
+top15 = (
+    ind1_latest
+    .dropna(subset=["obs_value"])
+    .nlargest(15, "obs_value")
+    .sort_values("obs_value", ascending=True)
+)
+
+(
+    ggplot(top15, aes(x="reorder(country, obs_value)", y="obs_value", fill="obs_value"))
+    + geom_col()
+    + coord_flip()   # flips x and y so bars go horizontal — easier to read country names
+    + scale_fill_gradient(low="#ef9a9a", high="#b71c1c")
+    + scale_y_continuous(labels=lambda l: [f"{int(v):,}" for v in l])
+    + theme_minimal()
+    + theme(
+        axis_text_y=element_text(size=9),
+        plot_title=element_text(weight="bold", size=12),
+        plot_subtitle=element_text(size=9, color="#555555"),
+        panel_grid_major_y=element_blank(),
+        figure_size=(9, 6),
+    )
+    + labs(
+        title="Top 15 Countries: Estimated New HIV Infections",
+        subtitle="Most recent year available per country | South Africa leads with ~39,000 new infections in 2024",
+        x="",
+        y="Estimated New Infections",
+        caption="Source: UNICEF",
+    )
+)
+```
+
+**South Africa** stands in a category of its own with nearly 39,000 new infections in 2024 — more than double that of second-placed Mozambique (17,000). India's appearance in third place is a reminder that the epidemic is not purely an African story. All 15 countries on this list share common risk factors: limited healthcare infrastructure, high poverty rates, and — in many cases — ongoing humanitarian crises.
+
+---
+
+## 💰 Does Wealth Determine Outcomes? — Scatterplot {#sec-scatter}
+
+A fundamental question in global health policy is whether economic development alone can drive down HIV infection rates, or whether targeted interventions are necessary regardless of a country's wealth.
+
+```{python}
+#| label: fig-scatter
+#| fig-cap: "GDP per capita vs. new HIV infections per country. Both axes use log scale."
+#| fig-width: 9
+#| fig-height: 6
+#| code-summary: "📈 Scatterplot with Linear Regression"
+
+# ── Merge HIV data with GDP from metadata ─────────────────────────
+# inner join: only keep countries that appear in BOTH datasets
+scatter_data = (
+    ind1_latest
+    .merge(
+        meta_latest[["country", gdp_col, life_col]],
+        on="country",
+        how="inner"
+    )
+    .dropna(subset=["obs_value", gdp_col])
+    .query("obs_value > 0 and `" + gdp_col + "` > 0")  # remove zeros (can't log-transform 0)
+)
+
+print(f"Countries available for scatter: {len(scatter_data)}")
+
+(
+    ggplot(scatter_data, aes(x=gdp_col, y="obs_value"))
+    # Each dot = one country
+    + geom_point(aes(color="obs_value"), alpha=0.7, size=3)
+    # geom_smooth adds the regression line with a confidence band
+    + geom_smooth(method="lm", color="#b71c1c", fill="#ef9a9a", alpha=0.2)
+    # Log scale on both axes because data spans several orders of magnitude
+    + scale_x_log10(labels=lambda l: [f"${int(v):,}" for v in l])
+    + scale_y_log10(labels=lambda l: [f"{int(v):,}" for v in l])
+    + scale_color_gradient(low="#ffcc80", high="#b71c1c")
+    + theme_minimal()
+    + theme(
+        plot_title=element_text(weight="bold", size=12),
+        plot_subtitle=element_text(size=9, color="#555555"),
+        figure_size=(9, 6),
+    )
+    + labs(
+        title="Wealthier Countries Report Fewer New HIV Infections",
+        subtitle="Each dot = one country | Log-log scale | OLS regression line with 95% confidence band",
+        x="GDP per Capita (constant 2015 USD, log scale)",
+        y="Estimated New HIV Infections (log scale)",
+        caption="Source: UNICEF Indicator & Metadata",
+    )
+)
+```
+
+The **downward-sloping regression line** confirms a clear negative relationship — as GDP per capita rises, new HIV infections tend to fall. However, the wide scatter around the line is equally important: several lower-income countries achieve surprisingly low infection rates, demonstrating that **policy choices, healthcare access, and community interventions** can meaningfully decouple outcomes from national wealth.
+
+---
+
+## 📉 Is the World Making Progress? — Time Series {#sec-timeseries}
+
+Progress against HIV must be measured over time. The chart below tracks how new infection estimates have changed year-by-year across **five of the highest-burden countries** in the dataset.
+
+```{python}
+#| label: fig-timeseries
+#| fig-cap: "Trends in estimated new HIV infections over time (2010–2024), selected countries."
+#| fig-width: 10
+#| fig-height: 6
+#| code-summary: "📉 Time Series Chart"
+
+# ── Select countries with full data coverage in indicator 1 ───────
+selected_countries = [
+    "South Africa", "Kenya", "Uganda",
+    "Zimbabwe", "Mozambique"
+]
+
+# Filter for Total sex and our selected countries
+ts_data = (
+    ind1_total                                              # already filtered for sex=Total
+    [ind1_total["country"].isin(selected_countries)]       # only our 5 countries
+    .dropna(subset=["obs_value"])
+    .copy()
+)
+
+# Make sure year is numeric so plotnine can draw a continuous line
+ts_data["time_period"] = pd.to_numeric(ts_data["time_period"], errors="coerce")
+ts_data = ts_data.dropna(subset=["time_period"])
+
+# ── Define distinct colours for each country ─────────────────────
+country_colours = {
+    "South Africa": "#b71c1c",
+    "Kenya":        "#1565c0",
+    "Uganda":       "#2e7d32",
+    "Zimbabwe":     "#6a1b9a",
+    "Mozambique":   "#e65100",
+}
+
+(
+    ggplot(ts_data, aes(x="time_period", y="obs_value", color="country", group="country"))
+    + geom_line(size=1.3)      # draw a line connecting the dots for each country
+    + geom_point(size=2.5, alpha=0.8)  # add a dot at each data point
+    + scale_color_manual(values=country_colours, name="Country")
+    + scale_y_continuous(labels=lambda l: [f"{int(v):,}" for v in l])
+    + theme_minimal()
+    + theme(
+        legend_position="right",
+        plot_title=element_text(weight="bold", size=12),
+        plot_subtitle=element_text(size=9, color="#555555"),
+        figure_size=(10, 6),
+    )
+    + labs(
+        title="New HIV Infections Over Time — Progress Is Real But Uneven",
+        subtitle="Estimated annual new HIV infections 2010–2024 | Declining trends signal improving prevention",
+        x="Year",
+        y="Estimated New Infections",
+        caption="Source: UNICEF Indicator Data",
+    )
+)
+```
+
+The time-series tells a story of **cautious optimism**. South Africa, despite its high absolute numbers, shows a meaningful downward trend from its 2010 peak — a testament to its large-scale antiretroviral therapy (ART) rollout. Zimbabwe and Uganda show similarly encouraging declines. Mozambique, however, remains elevated, highlighting that **progress is fragile** and requires sustained investment. Without continued political will and funding, these trends can — and do — reverse.
+
+---
+
+## 🔍 Key Findings
+
+The four visualisations together reveal a coherent and urgent picture:
+
+1. **Geography is destiny for too many children.** The world map shows HIV infections are overwhelmingly concentrated in Sub-Saharan Africa, with South Africa, Mozambique, and Tanzania recording the highest burdens.
+
+2. **The top 15 countries account for the vast majority of global infections.** South Africa alone recorded nearly 39,000 new infections in 2024 — a figure that demands targeted, country-specific intervention.
+
+3. **Wealth matters, but it is not sufficient.** The scatterplot confirms a negative relationship between GDP per capita and infection rates, yet significant variation exists — proving that policy and healthcare infrastructure matter independently of income.
+
+4. **Progress is real, but fragile.** Declining trends in South Africa, Zimbabwe, and Uganda are encouraging, but Mozambique's persistent high rates remind us the work is far from over.
+
+---
+
+## ✅ Conclusion
+
+The UNICEF data examined in this report makes one conclusion unavoidable: **the HIV epidemic remains a profound violation of children's rights**, concentrated in the countries least equipped to respond.
+
+The global community has the tools — antiretroviral therapy, prevention programmes, and community health workers. What is needed is sustained commitment: to funding, to equity, and to the children who cannot yet advocate for themselves.
+
+> *"We have the tools to end AIDS. What we need is the will."* — UNAIDS
+
+---
+
+*Report rendered with **Quarto**. Analysis conducted in Python using **pandas** for data manipulation and **plotnine** for visualisation. Geographic boundaries from Natural Earth via GeoPandas. Data source: **UNICEF Open Data**.*
